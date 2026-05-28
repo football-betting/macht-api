@@ -1,9 +1,9 @@
-use std::env;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::DateTime;
 use dotenv::dotenv;
 use rusqlite::Connection;
 use serde_derive::{Deserialize, Serialize};
 use serde_json::to_string;
+use std::env;
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ApiResult {
@@ -21,12 +21,6 @@ pub struct Match {
     pub status: String,
     pub homeScore: Option<isize>,
     pub awayScore: Option<isize>,
-}
-
-#[allow(non_snake_case)]
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct FoundMatch {
-    pub id: isize,
 }
 
 #[allow(non_snake_case)]
@@ -154,42 +148,50 @@ mod tests {
         let db_path = env::var("DB_PATH").unwrap();
         let conn = Connection::open(&db_path).unwrap();
 
-        let mut matches = vec![
-            Match {
-                id: 11111,
-                utcDate: "2022-01-01".to_string(),
-                homeTeam: Team {
-                    id: None,
-                    name: None,
-                    shortName: None,
-                    tla: None,
-                    flag: None,
-                },
-                awayTeam: Team {
-                    id: None,
-                    name: None,
-                    shortName: None,
-                    tla: None,
-                    flag: None,
-                },
-                score: Score {
-                    winner: None,
-                    duration: "".to_string(),
-                    fullTime: ScoreDetail { home: None, away: None },
-                    halfTime: ScoreDetail { home: None, away: None },
-                },
-                status: "SCHEDULED".to_string(),
-                homeScore: Some(0),
-                awayScore: Some(0),
+        let mut matches = vec![Match {
+            id: 11111,
+            utcDate: "2022-01-01".to_string(),
+            homeTeam: Team {
+                id: None,
+                name: None,
+                shortName: None,
+                tla: None,
+                flag: None,
             },
-        ];
+            awayTeam: Team {
+                id: None,
+                name: None,
+                shortName: None,
+                tla: None,
+                flag: None,
+            },
+            score: Score {
+                winner: None,
+                duration: "".to_string(),
+                fullTime: ScoreDetail {
+                    home: None,
+                    away: None,
+                },
+                halfTime: ScoreDetail {
+                    home: None,
+                    away: None,
+                },
+                regularTime: None,
+            },
+            status: "SCHEDULED".to_string(),
+            homeScore: Some(0),
+            awayScore: Some(0),
+        }];
 
         MatchClient::save_matches_to_sqlite(&mut matches).await;
 
-        let mut stmt = conn.prepare("SELECT * FROM match WHERE id = 11111").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM match WHERE id = 11111")
+            .unwrap();
         let match_exists = stmt.exists(()).unwrap();
 
-        conn.execute("DELETE FROM match WHERE id = 11111", ()).unwrap();
+        conn.execute("DELETE FROM match WHERE id = 11111", ())
+            .unwrap();
 
         assert!(match_exists);
     }
@@ -200,45 +202,53 @@ mod tests {
         let db_path = env::var("DB_PATH").unwrap();
         let conn = Connection::open(&db_path).unwrap();
 
-        let mut matches = vec![
-            Match {
-                id: 11111,
-                utcDate: "2022-01-01".to_string(),
-                homeTeam: Team {
-                    id: None,
-                    name: None,
-                    shortName: None,
-                    tla: None,
-                    flag: None,
-                },
-                awayTeam: Team {
-                    id: None,
-                    name: None,
-                    shortName: None,
-                    tla: None,
-                    flag: None,
-                },
-                score: Score {
-                    winner: None,
-                    duration: "".to_string(),
-                    fullTime: ScoreDetail { home: None, away: None },
-                    halfTime: ScoreDetail { home: None, away: None },
-                },
-                status: "SCHEDULED".to_string(),
-                homeScore: Some(0),
-                awayScore: Some(0),
+        let mut matches = vec![Match {
+            id: 11111,
+            utcDate: "2022-01-01".to_string(),
+            homeTeam: Team {
+                id: None,
+                name: None,
+                shortName: None,
+                tla: None,
+                flag: None,
             },
-        ];
+            awayTeam: Team {
+                id: None,
+                name: None,
+                shortName: None,
+                tla: None,
+                flag: None,
+            },
+            score: Score {
+                winner: None,
+                duration: "".to_string(),
+                fullTime: ScoreDetail {
+                    home: None,
+                    away: None,
+                },
+                halfTime: ScoreDetail {
+                    home: None,
+                    away: None,
+                },
+                regularTime: None,
+            },
+            status: "SCHEDULED".to_string(),
+            homeScore: Some(0),
+            awayScore: Some(0),
+        }];
 
         MatchClient::save_matches_to_sqlite(&mut matches).await;
 
         matches[0].status = "FINISHED".to_string();
         MatchClient::save_matches_to_sqlite(&mut matches).await;
 
-        let mut stmt = conn.prepare("SELECT status FROM match WHERE id = 11111").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT status FROM match WHERE id = 11111")
+            .unwrap();
         let status: String = stmt.query_row((), |row| row.get(0)).unwrap();
 
-        conn.execute("DELETE FROM match WHERE id = 11111", ()).unwrap();
+        conn.execute("DELETE FROM match WHERE id = 11111", ())
+            .unwrap();
 
         assert_eq!(status, "FINISHED");
     }
