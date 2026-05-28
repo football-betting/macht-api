@@ -1,7 +1,7 @@
 use chrono::DateTime;
-use dotenv::dotenv;
+use dotenvy::dotenv;
 use rusqlite::Connection;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::to_string;
 use std::env;
 
