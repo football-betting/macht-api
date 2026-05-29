@@ -150,7 +150,7 @@ mod tests {
 
         let mut matches = vec![Match {
             id: 11111,
-            utcDate: "2022-01-01".to_string(),
+            utcDate: "2022-01-01T00:00:00Z".to_string(),
             homeTeam: Team {
                 id: None,
                 name: None,
@@ -204,7 +204,7 @@ mod tests {
 
         let mut matches = vec![Match {
             id: 11111,
-            utcDate: "2022-01-01".to_string(),
+            utcDate: "2022-01-01T00:00:00Z".to_string(),
             homeTeam: Team {
                 id: None,
                 name: None,
