@@ -50,10 +50,12 @@ pub struct ScoreDetail {
     pub away: Option<isize>,
 }
 
+const TEAM_FIELD_MAX_LEN: usize = 255;
+
 pub struct MatchClient {}
 
 impl MatchClient {
-    pub async fn get_matches(date: Option<String>) -> ApiResult {
+    pub async fn get_matches(date: Option<String>) -> Option<ApiResult> {
         dotenv().ok();
 
         let mut uri = match env::var("API_URI") {
@@ -73,68 +75,147 @@ impl MatchClient {
 
         let client = reqwest::Client::new();
 
-        client
-            .get(uri)
-            .header("X-Auth-Token", token)
-            .send()
-            .await
-            .unwrap()
-            .json::<ApiResult>()
-            .await
-            .unwrap()
-    }
+        let response = match client.get(uri).header("X-Auth-Token", token).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("macht-api: upstream request failed: {e}");
+                return None;
+            }
+        };
 
-    pub async fn save_matches_to_sqlite(matches: &mut Vec<Match>) {
-        let db = Self::get_connection().await;
+        let response = match response.error_for_status() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("macht-api: upstream returned a non-success status: {e}");
+                return None;
+            }
+        };
 
-        for single_match in matches {
-            let mut stmt = db.prepare("SELECT * FROM match WHERE id = ?1").unwrap();
-            let match_already_exists = stmt.exists(rusqlite::params![single_match.id]).unwrap();
-
-            let datetime = DateTime::parse_from_rfc3339(&single_match.utcDate).unwrap();
-            let timestamp = datetime.timestamp();
-
-            if match_already_exists {
-                db.execute(
-                    "UPDATE match set homeTeam = ?1, awayTeam = ?2, status = ?3, utcDate = ?4, score = ?5, \
-                    homeScore = ?6, awayScore = ?7 WHERE id = ?8",
-                    (
-                        to_string(&single_match.homeTeam).unwrap(),
-                        to_string(&single_match.awayTeam).unwrap(),
-                        &single_match.status,
-                        timestamp,
-                        to_string(&single_match.score).unwrap(),
-                        &single_match.homeScore,
-                        &single_match.awayScore,
-                        &single_match.id,
-                    ),
-                ).unwrap();
-            } else {
-                db.execute(
-                    "INSERT INTO match (id, homeTeam, awayTeam, status, utcDate, score, homeScore, awayScore) \
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    (
-                        &single_match.id,
-                        to_string(&single_match.homeTeam).unwrap(),
-                        to_string(&single_match.awayTeam).unwrap(),
-                        &single_match.status,
-                        timestamp,
-                        to_string(&single_match.score).unwrap(),
-                        &single_match.homeScore,
-                        &single_match.awayScore,
-                    ),
-                ).unwrap();
+        match response.json::<ApiResult>().await {
+            Ok(result) => Some(result),
+            Err(e) => {
+                eprintln!("macht-api: failed to parse upstream response: {e}");
+                None
             }
         }
     }
 
-    async fn get_connection() -> Connection {
-        let db_path = match env::var("DB_PATH") {
-            Ok(v) => v.to_string(),
-            Err(_) => "Error loading env variable DB_PATH".to_string(),
+    pub async fn save_matches_to_sqlite(matches: &mut [Match]) {
+        let db = match Self::get_connection().await {
+            Some(db) => db,
+            None => return,
         };
 
-        Connection::open(db_path).unwrap()
+        let mut saved = 0usize;
+        let mut skipped = 0usize;
+
+        for single_match in matches.iter_mut() {
+            let datetime = match DateTime::parse_from_rfc3339(&single_match.utcDate) {
+                Ok(dt) => dt,
+                Err(e) => {
+                    eprintln!(
+                        "macht-api: skipping match {}: invalid utcDate {:?}: {e}",
+                        single_match.id, single_match.utcDate
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let timestamp = datetime.timestamp();
+
+            Self::normalize_team(&mut single_match.homeTeam);
+            Self::normalize_team(&mut single_match.awayTeam);
+
+            if let Err(e) = Self::persist_match(&db, single_match, timestamp) {
+                eprintln!("macht-api: skipping match {}: {e}", single_match.id);
+                skipped += 1;
+                continue;
+            }
+            saved += 1;
+        }
+
+        println!("macht-api: import finished — {saved} saved, {skipped} skipped");
+    }
+
+    fn normalize_team(team: &mut Team) {
+        team.name = Some(Self::sanitize_field(team.name.take()));
+        team.tla = Some(Self::sanitize_field(team.tla.take()));
+    }
+
+    fn sanitize_field(value: Option<String>) -> String {
+        let value = value.unwrap_or_default();
+        if value.chars().count() <= TEAM_FIELD_MAX_LEN {
+            return value;
+        }
+        value.chars().take(TEAM_FIELD_MAX_LEN).collect()
+    }
+
+    fn persist_match(
+        db: &Connection,
+        single_match: &Match,
+        timestamp: i64,
+    ) -> rusqlite::Result<()> {
+        let mut stmt = db.prepare("SELECT * FROM match WHERE id = ?1")?;
+        let match_already_exists = stmt.exists(rusqlite::params![single_match.id])?;
+
+        let home_team = to_string(&single_match.homeTeam)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let away_team = to_string(&single_match.awayTeam)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let score = to_string(&single_match.score)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+        if match_already_exists {
+            db.execute(
+                "UPDATE match set homeTeam = ?1, awayTeam = ?2, status = ?3, utcDate = ?4, score = ?5, \
+                homeScore = ?6, awayScore = ?7 WHERE id = ?8",
+                (
+                    home_team,
+                    away_team,
+                    &single_match.status,
+                    timestamp,
+                    score,
+                    &single_match.homeScore,
+                    &single_match.awayScore,
+                    &single_match.id,
+                ),
+            )?;
+        } else {
+            db.execute(
+                "INSERT INTO match (id, homeTeam, awayTeam, status, utcDate, score, homeScore, awayScore) \
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    &single_match.id,
+                    home_team,
+                    away_team,
+                    &single_match.status,
+                    timestamp,
+                    score,
+                    &single_match.homeScore,
+                    &single_match.awayScore,
+                ),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_connection() -> Option<Connection> {
+        let db_path = match env::var("DB_PATH") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("macht-api: env variable DB_PATH not set");
+                return None;
+            }
+        };
+
+        match Connection::open(db_path) {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                eprintln!("macht-api: failed to open database: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -251,5 +332,112 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, "FINISHED");
+    }
+
+    fn sample_match(id: isize, utc_date: &str) -> Match {
+        Match {
+            id,
+            utcDate: utc_date.to_string(),
+            homeTeam: Team {
+                id: None,
+                name: None,
+                shortName: None,
+                tla: None,
+                flag: None,
+            },
+            awayTeam: Team {
+                id: None,
+                name: None,
+                shortName: None,
+                tla: None,
+                flag: None,
+            },
+            score: Score {
+                winner: None,
+                duration: "".to_string(),
+                fullTime: ScoreDetail {
+                    home: None,
+                    away: None,
+                },
+                halfTime: ScoreDetail {
+                    home: None,
+                    away: None,
+                },
+                regularTime: None,
+            },
+            status: "SCHEDULED".to_string(),
+            homeScore: Some(0),
+            awayScore: Some(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_date_skips_only_that_match() {
+        dotenv().ok();
+        let db_path = env::var("DB_PATH").unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+
+        let mut matches = vec![
+            sample_match(11112, "not-a-date"),
+            sample_match(11113, "2022-01-01T00:00:00Z"),
+        ];
+
+        MatchClient::save_matches_to_sqlite(&mut matches).await;
+
+        let mut bad_stmt = conn
+            .prepare("SELECT * FROM match WHERE id = 11112")
+            .unwrap();
+        let bad_exists = bad_stmt.exists(()).unwrap();
+        let mut good_stmt = conn
+            .prepare("SELECT * FROM match WHERE id = 11113")
+            .unwrap();
+        let good_exists = good_stmt.exists(()).unwrap();
+
+        conn.execute("DELETE FROM match WHERE id IN (11112, 11113)", ())
+            .unwrap();
+
+        assert!(!bad_exists);
+        assert!(good_exists);
+    }
+
+    #[tokio::test]
+    async fn null_team_fields_persist_as_non_null_strings() {
+        dotenv().ok();
+        let db_path = env::var("DB_PATH").unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+
+        let mut matches = vec![sample_match(11114, "2022-01-01T00:00:00Z")];
+
+        MatchClient::save_matches_to_sqlite(&mut matches).await;
+
+        let mut stmt = conn
+            .prepare("SELECT homeTeam, awayTeam FROM match WHERE id = 11114")
+            .unwrap();
+        let (home_team, away_team): (String, String) = stmt
+            .query_row((), |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+
+        conn.execute("DELETE FROM match WHERE id = 11114", ())
+            .unwrap();
+
+        let home: Team = serde_json::from_str(&home_team).unwrap();
+        let away: Team = serde_json::from_str(&away_team).unwrap();
+
+        assert_eq!(home.name.as_deref(), Some(""));
+        assert_eq!(home.tla.as_deref(), Some(""));
+        assert_eq!(away.name.as_deref(), Some(""));
+        assert_eq!(away.tla.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn sanitize_field_caps_length_and_defaults_null() {
+        assert_eq!(MatchClient::sanitize_field(None), "");
+        assert_eq!(MatchClient::sanitize_field(Some("GER".to_string())), "GER");
+
+        let long = "a".repeat(TEAM_FIELD_MAX_LEN + 50);
+        assert_eq!(
+            MatchClient::sanitize_field(Some(long)).len(),
+            TEAM_FIELD_MAX_LEN
+        );
     }
 }

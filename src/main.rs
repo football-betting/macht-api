@@ -18,14 +18,19 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    let mut api_result: ApiResult;
-    if args.full {
-        api_result = MatchClient::get_matches(None).await;
+    let api_result: Option<ApiResult> = if args.full {
+        MatchClient::get_matches(None).await
     } else {
-        api_result =
-            MatchClient::get_matches(Some(chrono::offset::Utc::now().date_naive().to_string()))
-                .await;
-    }
+        MatchClient::get_matches(Some(chrono::offset::Utc::now().date_naive().to_string())).await
+    };
+
+    let mut api_result = match api_result {
+        Some(result) => result,
+        None => {
+            eprintln!("macht-api: no usable upstream data — aborting import without changes");
+            return;
+        }
+    };
 
     if let Some(matches) = api_result.matches.as_mut() {
         ScoreHelper::set_home_and_away_score(matches);
