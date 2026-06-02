@@ -1,0 +1,10 @@
+[Unit]
+Description=macht-api — match importer (oneshot, triggered by macht-api.timer)
+After=network.target
+
+[Service]
+Type=oneshot
+# Adjust WorkingDirectory / paths to your deployment.
+WorkingDirectory=/opt/football-betting/macht-api
+EnvironmentFile=/opt/football-betting/macht-api/.env
+ExecStart=/opt/football-betting/macht-api/target/release/rust-api
