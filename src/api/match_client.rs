@@ -123,6 +123,15 @@ impl MatchClient {
             };
             let timestamp = datetime.timestamp();
 
+            // Undetermined pairing (e.g. knockout placeholder with empty teams):
+            // don't import it. Any earlier placeholders are cleared by a DB reset.
+            if !Self::team_determined(&single_match.homeTeam)
+                || !Self::team_determined(&single_match.awayTeam)
+            {
+                skipped += 1;
+                continue;
+            }
+
             Self::normalize_team(&mut single_match.homeTeam);
             Self::normalize_team(&mut single_match.awayTeam);
 
@@ -135,6 +144,14 @@ impl MatchClient {
         }
 
         println!("macht-api: import finished — {saved} saved, {skipped} skipped");
+    }
+
+    // A team is "determined" once the upstream provides a real name or tla.
+    // Knockout placeholders arrive with all fields null/empty.
+    fn team_determined(team: &Team) -> bool {
+        let has_value =
+            |v: &Option<String>| v.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        has_value(&team.name) || has_value(&team.tla)
     }
 
     fn normalize_team(team: &mut Team) {
@@ -252,17 +269,17 @@ mod tests {
             id: 11111,
             utcDate: "2022-01-01T00:00:00Z".to_string(),
             homeTeam: Team {
-                id: None,
-                name: None,
+                id: Some(1),
+                name: Some("Home Team".to_string()),
                 shortName: None,
-                tla: None,
+                tla: Some("HOM".to_string()),
                 flag: None,
             },
             awayTeam: Team {
-                id: None,
-                name: None,
+                id: Some(2),
+                name: Some("Away Team".to_string()),
                 shortName: None,
-                tla: None,
+                tla: Some("AWY".to_string()),
                 flag: None,
             },
             score: Score {
@@ -306,17 +323,17 @@ mod tests {
             id: 11111,
             utcDate: "2022-01-01T00:00:00Z".to_string(),
             homeTeam: Team {
-                id: None,
-                name: None,
+                id: Some(1),
+                name: Some("Home Team".to_string()),
                 shortName: None,
-                tla: None,
+                tla: Some("HOM".to_string()),
                 flag: None,
             },
             awayTeam: Team {
-                id: None,
-                name: None,
+                id: Some(2),
+                name: Some("Away Team".to_string()),
                 shortName: None,
-                tla: None,
+                tla: Some("AWY".to_string()),
                 flag: None,
             },
             score: Score {
@@ -358,17 +375,17 @@ mod tests {
             id,
             utcDate: utc_date.to_string(),
             homeTeam: Team {
-                id: None,
-                name: None,
+                id: Some(1),
+                name: Some("Home Team".to_string()),
                 shortName: None,
-                tla: None,
+                tla: Some("HOM".to_string()),
                 flag: None,
             },
             awayTeam: Team {
-                id: None,
-                name: None,
+                id: Some(2),
+                name: Some("Away Team".to_string()),
                 shortName: None,
-                tla: None,
+                tla: Some("AWY".to_string()),
                 flag: None,
             },
             score: Score {
@@ -420,32 +437,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn null_team_fields_persist_as_non_null_strings() {
+    async fn partial_team_fields_normalize_to_non_null_strings() {
         dotenv().ok();
         let db_path = env::var("DB_PATH").unwrap();
         let conn = Connection::open(&db_path).unwrap();
 
-        let mut matches = vec![sample_match(11114, "2022-01-01T00:00:00Z")];
+        // Determined via name, but tla missing -> imported, tla normalized to "".
+        let mut m = sample_match(11114, "2022-01-01T00:00:00Z");
+        m.homeTeam.tla = None;
+        let mut matches = vec![m];
 
         MatchClient::save_matches_to_sqlite(&mut matches).await;
 
         let mut stmt = conn
-            .prepare("SELECT homeTeam, awayTeam FROM match WHERE id = 11114")
+            .prepare("SELECT homeTeam FROM match WHERE id = 11114")
             .unwrap();
-        let (home_team, away_team): (String, String) = stmt
-            .query_row((), |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap();
+        let home_team: String = stmt.query_row((), |row| row.get(0)).unwrap();
 
         conn.execute("DELETE FROM match WHERE id = 11114", ())
             .unwrap();
 
         let home: Team = serde_json::from_str(&home_team).unwrap();
-        let away: Team = serde_json::from_str(&away_team).unwrap();
-
-        assert_eq!(home.name.as_deref(), Some(""));
+        assert_eq!(home.name.as_deref(), Some("Home Team"));
         assert_eq!(home.tla.as_deref(), Some(""));
-        assert_eq!(away.name.as_deref(), Some(""));
-        assert_eq!(away.tla.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn undetermined_team_match_is_skipped() {
+        dotenv().ok();
+        let db_path = env::var("DB_PATH").unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+
+        // An undetermined pairing (both teams null) plus a determined one.
+        let mut placeholder = sample_match(11116, "2022-01-01T00:00:00Z");
+        placeholder.homeTeam = Team {
+            id: None,
+            name: None,
+            shortName: None,
+            tla: None,
+            flag: None,
+        };
+        placeholder.awayTeam = Team {
+            id: None,
+            name: None,
+            shortName: None,
+            tla: None,
+            flag: None,
+        };
+        let mut matches = vec![placeholder, sample_match(11117, "2022-01-01T00:00:00Z")];
+
+        MatchClient::save_matches_to_sqlite(&mut matches).await;
+
+        let undetermined_exists = conn
+            .prepare("SELECT * FROM match WHERE id = 11116")
+            .unwrap()
+            .exists(())
+            .unwrap();
+        let determined_exists = conn
+            .prepare("SELECT * FROM match WHERE id = 11117")
+            .unwrap()
+            .exists(())
+            .unwrap();
+
+        conn.execute("DELETE FROM match WHERE id IN (11116, 11117)", ())
+            .unwrap();
+
+        // Undetermined: not imported. Determined neighbour: imported.
+        assert!(!undetermined_exists);
+        assert!(determined_exists);
     }
 
     #[test]
