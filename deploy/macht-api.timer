@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the macht-api match importer every minute
+
+[Timer]
+OnCalendar=*:0/1
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
