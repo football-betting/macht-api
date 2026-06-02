@@ -1,0 +1,74 @@
+name: macht-api-ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: macht-api-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Run JS actions on Node 24 (covers actions that still ship a Node 20 runtime).
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Throwaway DB for the integration tests — never the shared dev DB.
+  DB_PATH: ${{ github.workspace }}/ci-test.db
+  # Tests share one DB file and reuse match ids, so they must run serially.
+  RUST_TEST_THREADS: "1"
+
+jobs:
+  ci:
+    name: fmt · clippy · test · coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Seed throwaway test database
+        run: |
+          sudo apt-get update && sudo apt-get install -y sqlite3
+          sqlite3 "$DB_PATH" 'CREATE TABLE `match` (
+            `id` integer PRIMARY KEY NOT NULL,
+            `homeTeam` text NOT NULL,
+            `awayTeam` text NOT NULL,
+            `status` text NOT NULL,
+            `utcDate` integer NOT NULL,
+            `score` text,
+            `homeScore` integer,
+            `awayScore` integer
+          );'
+          sqlite3 "$DB_PATH" 'PRAGMA journal_mode=WAL;'
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Coverage
+        run: cargo tarpaulin --out Xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: football-betting/macht-api
+          files: ./cobertura.xml
+          fail_ci_if_error: false
