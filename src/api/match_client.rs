@@ -210,7 +210,26 @@ impl MatchClient {
         };
 
         match Connection::open(db_path) {
-            Ok(conn) => Some(conn),
+            Ok(conn) => {
+                // Shared DB with frontend + betting-api: wait for the lock
+                // instead of failing with SQLITE_BUSY, and use WAL so the
+                // importer's writes don't block readers.
+                if let Err(e) =
+                    conn.busy_timeout(std::time::Duration::from_millis(5000))
+                {
+                    eprintln!("macht-api: failed to set busy_timeout: {e}");
+                    return None;
+                }
+                if let Err(e) =
+                    conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                {
+                    eprintln!("macht-api: failed to enable WAL: {e}");
+                    return None;
+                }
+                Some(conn)
+            }
             Err(e) => {
                 eprintln!("macht-api: failed to open database: {e}");
                 None
