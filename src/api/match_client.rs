@@ -51,6 +51,7 @@ pub struct ScoreDetail {
 }
 
 const TEAM_FIELD_MAX_LEN: usize = 255;
+const BUSY_TIMEOUT_MS: u64 = 5000;
 
 pub struct MatchClient {}
 
@@ -227,27 +228,32 @@ impl MatchClient {
         };
 
         match Connection::open(db_path) {
-            Ok(conn) => {
-                // Shared DB with frontend + betting-api: wait for the lock
-                // instead of failing with SQLITE_BUSY, and use WAL so the
-                // importer's writes don't block readers.
-                if let Err(e) = conn.busy_timeout(std::time::Duration::from_millis(5000)) {
-                    eprintln!("macht-api: failed to set busy_timeout: {e}");
-                    return None;
+            Ok(conn) => match Self::configure_connection(&conn) {
+                Ok(()) => Some(conn),
+                Err(e) => {
+                    eprintln!("macht-api: failed to configure connection: {e}");
+                    None
                 }
-                if let Err(e) = conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
-                    row.get::<_, String>(0)
-                }) {
-                    eprintln!("macht-api: failed to enable WAL: {e}");
-                    return None;
-                }
-                Some(conn)
-            }
+            },
             Err(e) => {
                 eprintln!("macht-api: failed to open database: {e}");
                 None
             }
         }
+    }
+
+    // Shared DB with frontend + betting-api. busy_timeout: wait for the lock
+    // instead of failing with SQLITE_BUSY. WAL: the importer's writes don't
+    // block readers. synchronous=NORMAL: safe under WAL and shortens the fsync,
+    // so the write lock is held for less time — less contention between the two
+    // writers (frontend tip writes + this importer).
+    fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS))?;
+        conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+        Ok(())
     }
 }
 
@@ -548,5 +554,210 @@ mod tests {
         MatchClient::normalize_team(&mut t);
         assert_eq!(t.name.as_deref(), Some(""));
         assert_eq!(t.tla.as_deref(), Some("GER"));
+    }
+
+    // --- Upstream API contract: deserialization (no DB, no network) ---
+
+    #[test]
+    fn deserializes_full_upstream_match() {
+        let json = r#"{
+            "matches": [{
+                "id": 537901,
+                "utcDate": "2026-06-11T19:00:00Z",
+                "homeTeam": {"id": 759, "name": "Germany", "shortName": "Germany", "tla": "GER", "crest": "https://crests.football-data.org/759.png"},
+                "awayTeam": {"id": 760, "name": "Scotland", "shortName": "Scotland", "tla": "SCO", "crest": "https://crests.football-data.org/760.png"},
+                "score": {
+                    "winner": "HOME_TEAM",
+                    "duration": "REGULAR",
+                    "fullTime": {"home": 5, "away": 1},
+                    "halfTime": {"home": 2, "away": 1},
+                    "regularTime": {"home": 5, "away": 1}
+                },
+                "status": "FINISHED",
+                "homeScore": 5,
+                "awayScore": 1
+            }]
+        }"#;
+
+        let result: ApiResult = serde_json::from_str(json).unwrap();
+        let matches = result.matches.expect("matches present");
+        assert_eq!(matches.len(), 1);
+        let m = &matches[0];
+        assert_eq!(m.id, 537901);
+        assert_eq!(m.status, "FINISHED");
+        assert_eq!(m.homeTeam.tla.as_deref(), Some("GER"));
+        // serde rename: upstream "crest" maps onto the internal `flag` field.
+        assert_eq!(
+            m.homeTeam.flag.as_deref(),
+            Some("https://crests.football-data.org/759.png")
+        );
+        assert_eq!(m.score.fullTime.home, Some(5));
+        assert_eq!(m.score.regularTime.as_ref().unwrap().home, Some(5));
+        assert_eq!(m.score.winner.as_deref(), Some("HOME_TEAM"));
+    }
+
+    #[test]
+    fn deserializes_response_without_matches_as_none() {
+        // football-data.org returns an error/quota object with no "matches"
+        // array. main.rs relies on this becoming None -> abort without changes.
+        let json = r#"{ "message": "You reached your request limit.", "errorCode": 429 }"#;
+        let result: ApiResult = serde_json::from_str(json).unwrap();
+        assert!(result.matches.is_none());
+    }
+
+    #[test]
+    fn deserializes_knockout_placeholder_with_null_teams() {
+        // A not-yet-determined knockout fixture: teams and scores all null,
+        // regularTime absent. Must deserialize, then read as undetermined.
+        let json = r#"{
+            "matches": [{
+                "id": 600000,
+                "utcDate": "2026-07-09T19:00:00Z",
+                "homeTeam": {"id": null, "name": null, "shortName": null, "tla": null, "crest": null},
+                "awayTeam": {"id": null, "name": null, "shortName": null, "tla": null, "crest": null},
+                "score": {
+                    "winner": null,
+                    "duration": "REGULAR",
+                    "fullTime": {"home": null, "away": null},
+                    "halfTime": {"home": null, "away": null}
+                },
+                "status": "TIMED",
+                "homeScore": null,
+                "awayScore": null
+            }]
+        }"#;
+
+        let result: ApiResult = serde_json::from_str(json).unwrap();
+        let m = &result.matches.unwrap()[0];
+        // regularTime omitted upstream -> None (falls back to fullTime later).
+        assert!(m.score.regularTime.is_none());
+        assert!(!MatchClient::team_determined(&m.homeTeam));
+        assert!(!MatchClient::team_determined(&m.awayTeam));
+    }
+
+    // --- Cross-service serialization contract (schema lockstep) ---
+
+    #[test]
+    fn team_serializes_to_frontend_contract_keys() {
+        // The frontend schema and betting-api read homeTeam/awayTeam JSON as
+        // {name, tla, crest?}. The internal field is `flag`, serialized as
+        // "crest" — that rename must hold on the way out, too.
+        let t = Team {
+            id: Some(759),
+            name: Some("Germany".to_string()),
+            shortName: Some("Germany".to_string()),
+            tla: Some("GER".to_string()),
+            flag: Some("https://crests.football-data.org/759.png".to_string()),
+        };
+
+        let value: serde_json::Value = serde_json::from_str(&to_string(&t).unwrap()).unwrap();
+        assert_eq!(value["name"], "Germany");
+        assert_eq!(value["tla"], "GER");
+        assert_eq!(value["crest"], "https://crests.football-data.org/759.png");
+        assert!(
+            value.get("flag").is_none(),
+            "internal field name `flag` must not leak into the shared DB JSON"
+        );
+    }
+
+    // --- sanitize_field: multibyte safety ---
+
+    #[test]
+    fn sanitize_field_truncates_on_char_boundary_not_bytes() {
+        // Each 'ü' is 2 bytes: a byte-based cap could split a char and panic.
+        let input = "ü".repeat(TEAM_FIELD_MAX_LEN + 10);
+        let out = MatchClient::sanitize_field(Some(input));
+        assert_eq!(out.chars().count(), TEAM_FIELD_MAX_LEN);
+        // Valid UTF-8 with no split char: the end is a char boundary.
+        assert!(out.is_char_boundary(out.len()));
+    }
+
+    // --- Connection robustness under concurrent access ---
+
+    #[test]
+    fn configure_connection_sets_wal_and_normal_synchronous() {
+        let conn = Connection::open_in_memory().unwrap();
+        MatchClient::configure_connection(&conn).unwrap();
+        // in-memory DBs report "memory" journal mode, so assert synchronous
+        // (1 = NORMAL) which applies regardless of the backing store.
+        let synchronous: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous should be NORMAL (1)");
+    }
+
+    #[test]
+    fn concurrent_writers_and_reader_share_one_db_without_lock_errors() {
+        use std::thread;
+
+        const WRITERS: i64 = 4;
+        const ROWS_PER_WRITER: i64 = 50;
+
+        let path =
+            std::env::temp_dir().join(format!("macht_api_concurrency_{}.db", std::process::id()));
+        let cleanup = |p: &std::path::Path| {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(format!("{}-wal", p.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", p.display()));
+        };
+        cleanup(&path);
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            MatchClient::configure_connection(&conn).unwrap();
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS match (id INTEGER PRIMARY KEY, status TEXT)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let mut handles = Vec::new();
+
+        for w in 0..WRITERS {
+            let p = path.clone();
+            handles.push(thread::spawn(move || {
+                let conn = Connection::open(&p).unwrap();
+                MatchClient::configure_connection(&conn).unwrap();
+                for i in 0..ROWS_PER_WRITER {
+                    // .unwrap() here is the assertion: a write that could not
+                    // acquire the lock within busy_timeout would panic and fail
+                    // the test — i.e. the "connection is gone" failure mode.
+                    conn.execute(
+                        "INSERT OR REPLACE INTO match (id, status) VALUES (?1, ?2)",
+                        rusqlite::params![w * 1000 + i, "SCHEDULED"],
+                    )
+                    .unwrap();
+                }
+            }));
+        }
+
+        // A reader running concurrently with the writers must never be blocked
+        // out under WAL.
+        {
+            let p = path.clone();
+            handles.push(thread::spawn(move || {
+                let conn = Connection::open(&p).unwrap();
+                MatchClient::configure_connection(&conn).unwrap();
+                for _ in 0..ROWS_PER_WRITER {
+                    let _count: i64 = conn
+                        .query_row("SELECT count(*) FROM match", [], |row| row.get(0))
+                        .unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let conn = Connection::open(&path).unwrap();
+        MatchClient::configure_connection(&conn).unwrap();
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM match", [], |row| row.get(0))
+            .unwrap();
+        cleanup(&path);
+
+        assert_eq!(total, WRITERS * ROWS_PER_WRITER);
     }
 }
