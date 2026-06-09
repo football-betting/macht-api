@@ -260,6 +260,8 @@ impl MatchClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header, method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn save_matches_to_sqlite_inserts_new_match() {
@@ -759,5 +761,130 @@ mod tests {
         cleanup(&path);
 
         assert_eq!(total, WRITERS * ROWS_PER_WRITER);
+    }
+
+    // --- get_matches: upstream HTTP paths (mock server) ---
+    //
+    // These mutate process-global env (API_URI / X_AUTH_TOKEN / DB_PATH). The
+    // suite already runs serially in CI (RUST_TEST_THREADS=1) because the
+    // DB-backed tests share one DB_PATH, so the env mutation is safe here too.
+    // dotenvy::dotenv() does not override already-set vars, so the values set
+    // below win over any .env file.
+
+    const SINGLE_MATCH_BODY: &str = r#"{
+        "matches": [{
+            "id": 700001,
+            "utcDate": "2026-06-11T19:00:00Z",
+            "homeTeam": {"id": 1, "name": "Germany", "shortName": "GER", "tla": "GER", "crest": null},
+            "awayTeam": {"id": 2, "name": "Scotland", "shortName": "SCO", "tla": "SCO", "crest": null},
+            "score": {"winner": null, "duration": "REGULAR", "fullTime": {"home": null, "away": null}, "halfTime": {"home": null, "away": null}},
+            "status": "TIMED",
+            "homeScore": null,
+            "awayScore": null
+        }]
+    }"#;
+
+    #[tokio::test]
+    async fn get_matches_parses_successful_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(SINGLE_MATCH_BODY, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        std::env::set_var("API_URI", server.uri());
+        std::env::set_var("X_AUTH_TOKEN", "test-token");
+
+        let result = MatchClient::get_matches(None).await;
+
+        let matches = result.expect("Some result").matches.expect("matches");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, 700001);
+        assert_eq!(matches[0].homeTeam.tla.as_deref(), Some("GER"));
+    }
+
+    #[tokio::test]
+    async fn get_matches_sends_auth_header_and_date_query() {
+        let server = MockServer::start().await;
+        // The mock only matches when the auth header and both date params are
+        // present, so a 200 here proves get_matches built the request correctly.
+        Mock::given(method("GET"))
+            .and(header("X-Auth-Token", "secret-xyz"))
+            .and(query_param("dateFrom", "2026-06-11"))
+            .and(query_param("dateTo", "2026-06-11"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(r#"{"matches":[]}"#, "application/json"),
+            )
+            .mount(&server)
+            .await;
+        std::env::set_var("API_URI", server.uri());
+        std::env::set_var("X_AUTH_TOKEN", "secret-xyz");
+
+        let result = MatchClient::get_matches(Some("2026-06-11".to_string())).await;
+
+        assert_eq!(
+            result.expect("Some result").matches.expect("matches").len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn get_matches_returns_none_on_error_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        std::env::set_var("API_URI", server.uri());
+        std::env::set_var("X_AUTH_TOKEN", "test-token");
+
+        assert!(MatchClient::get_matches(None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_matches_returns_none_on_malformed_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("definitely not json", "application/json"),
+            )
+            .mount(&server)
+            .await;
+        std::env::set_var("API_URI", server.uri());
+        std::env::set_var("X_AUTH_TOKEN", "test-token");
+
+        assert!(MatchClient::get_matches(None).await.is_none());
+    }
+
+    // --- get_connection: error branches (save/restore DB_PATH for the suite) ---
+
+    #[tokio::test]
+    async fn save_matches_is_noop_when_db_path_unset() {
+        let saved = std::env::var("DB_PATH").ok();
+        std::env::remove_var("DB_PATH");
+
+        let mut matches = vec![sample_match(199990, "2022-01-01T00:00:00Z")];
+        // Graceful no-op: get_connection returns None, save_matches returns.
+        MatchClient::save_matches_to_sqlite(&mut matches).await;
+
+        if let Some(v) = saved {
+            std::env::set_var("DB_PATH", v);
+        }
+    }
+
+    #[tokio::test]
+    async fn save_matches_is_noop_when_db_path_unopenable() {
+        let saved = std::env::var("DB_PATH").ok();
+        std::env::set_var("DB_PATH", "/nonexistent-dir-xyz/cannot/open.db");
+
+        let mut matches = vec![sample_match(199991, "2022-01-01T00:00:00Z")];
+        // Connection::open fails -> get_connection None -> no panic, no write.
+        MatchClient::save_matches_to_sqlite(&mut matches).await;
+
+        match saved {
+            Some(v) => std::env::set_var("DB_PATH", v),
+            None => std::env::remove_var("DB_PATH"),
+        }
     }
 }
