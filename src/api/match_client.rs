@@ -514,4 +514,39 @@ mod tests {
             TEAM_FIELD_MAX_LEN
         );
     }
+
+    fn team(name: Option<&str>, tla: Option<&str>) -> Team {
+        Team {
+            id: None,
+            name: name.map(str::to_string),
+            shortName: None,
+            tla: tla.map(str::to_string),
+            flag: None,
+        }
+    }
+
+    #[test]
+    fn team_determined_true_when_name_or_tla_present() {
+        assert!(MatchClient::team_determined(&team(Some("Germany"), None)));
+        assert!(MatchClient::team_determined(&team(None, Some("GER"))));
+        assert!(MatchClient::team_determined(&team(
+            Some("Germany"),
+            Some("GER")
+        )));
+    }
+
+    #[test]
+    fn team_determined_false_when_null_or_blank() {
+        assert!(!MatchClient::team_determined(&team(None, None)));
+        // Whitespace-only / empty strings are treated as undetermined.
+        assert!(!MatchClient::team_determined(&team(Some("   "), Some(""))));
+    }
+
+    #[test]
+    fn normalize_team_fills_nulls_with_empty_strings() {
+        let mut t = team(None, Some("GER"));
+        MatchClient::normalize_team(&mut t);
+        assert_eq!(t.name.as_deref(), Some(""));
+        assert_eq!(t.tla.as_deref(), Some("GER"));
+    }
 }
