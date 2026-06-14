@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the macht-api full importer 3x/day (02:00/10:00/18:00 UTC)
+
+[Timer]
+# systemd >= 252 supports the trailing timezone. On older systemd (< 252) drop
+# the "UTC" suffix and use local-time equivalents instead — see deploy README.
+OnCalendar=*-*-* 02,10,18:00:00 UTC
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target
