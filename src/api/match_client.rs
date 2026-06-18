@@ -56,7 +56,7 @@ const BUSY_TIMEOUT_MS: u64 = 5000;
 pub struct MatchClient {}
 
 impl MatchClient {
-    pub async fn get_matches(date: Option<String>) -> Option<ApiResult> {
+    pub async fn get_matches(date_range: Option<(String, String)>) -> Option<ApiResult> {
         dotenv().ok();
 
         let mut uri = match env::var("API_URI") {
@@ -64,8 +64,8 @@ impl MatchClient {
             Err(_) => "Error loading env variable API_URI".to_string(),
         };
 
-        uri = match date {
-            Some(d) => uri + "?dateFrom=" + d.as_str() + "&dateTo=" + d.as_str(),
+        uri = match date_range {
+            Some((from, to)) => uri + "?dateFrom=" + from.as_str() + "&dateTo=" + to.as_str(),
             None => uri,
         };
 
@@ -811,8 +811,8 @@ mod tests {
         // present, so a 200 here proves get_matches built the request correctly.
         Mock::given(method("GET"))
             .and(header("X-Auth-Token", "secret-xyz"))
-            .and(query_param("dateFrom", "2026-06-11"))
-            .and(query_param("dateTo", "2026-06-11"))
+            .and(query_param("dateFrom", "2026-06-10"))
+            .and(query_param("dateTo", "2026-06-12"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_raw(r#"{"matches":[]}"#, "application/json"),
             )
@@ -821,7 +821,9 @@ mod tests {
         std::env::set_var("API_URI", server.uri());
         std::env::set_var("X_AUTH_TOKEN", "secret-xyz");
 
-        let result = MatchClient::get_matches(Some("2026-06-11".to_string())).await;
+        let result =
+            MatchClient::get_matches(Some(("2026-06-10".to_string(), "2026-06-12".to_string())))
+                .await;
 
         assert_eq!(
             result.expect("Some result").matches.expect("matches").len(),
