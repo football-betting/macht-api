@@ -1,0 +1,10 @@
+[Unit]
+Description=macht-api — full match importer (all dates; catches UTC-midnight rollover stragglers)
+After=network.target
+
+[Service]
+Type=oneshot
+# Adjust WorkingDirectory / paths to your deployment.
+WorkingDirectory=/opt/football-betting/macht-api
+EnvironmentFile=/opt/football-betting/macht-api/.env
+ExecStart=/opt/football-betting/macht-api/target/release/rust-api --full
